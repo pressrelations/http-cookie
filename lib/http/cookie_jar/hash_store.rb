@@ -52,15 +52,19 @@ class HTTP::CookieJar
     end
 
     def add(cookie)
-      path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
-      path_cookies[cookie.name] = cookie
+      synchronize {
+        path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
+        path_cookies[cookie.name] = cookie
+      }
       cleanup if (@gc_index += 1) >= @gc_threshold
       self
     end
 
     def delete(cookie)
-      path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
-      path_cookies.delete(cookie.name)
+      synchronize {
+        path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
+        path_cookies.delete(cookie.name)
+      }
       self
     end
 
@@ -69,20 +73,21 @@ class HTTP::CookieJar
       if uri
         thost = DomainName.new(uri.host)
         tpath = uri.path
-        @jar.each { |domain, paths|
-          next unless thost.cookie_domain?(domain)
-          paths.each { |path, hash|
-            next unless HTTP::Cookie.path_match?(path, tpath)
-            hash.delete_if { |name, cookie|
-              if cookie.expired?(now)
-                true
-              else
-                if cookie.valid_for_uri?(uri)
-                  cookie.accessed_at = now
-                  yield cookie
+        synchronize {
+          @jar.each { |domain, paths|
+            next unless thost.cookie_domain?(domain)
+            paths.each { |path, hash|
+              next unless HTTP::Cookie.path_match?(path, tpath)
+              hash.each { |name, cookie|
+                if cookie.expired?(now)
+                  delete(cookie)
+                else
+                  if cookie.valid_for_uri?(uri)
+                    cookie.accessed_at = now
+                    yield cookie
+                  end
                 end
-                false
-              end
+              }
             }
           }
         }
@@ -90,12 +95,11 @@ class HTTP::CookieJar
         synchronize {
           @jar.each { |domain, paths|
             paths.each { |path, hash|
-              hash.delete_if { |name, cookie|
+              hash.each { |name, cookie|
                 if cookie.expired?(now)
-                  true
+                  delete(cookie)
                 else
                   yield cookie
-                  false
                 end
               }
             }
@@ -114,16 +118,16 @@ class HTTP::CookieJar
       now = Time.now
       all_cookies = []
 
-      synchronize {
-        break if @gc_index == 0
+      return self if @gc_index == 0
 
+      synchronize {
         @jar.each { |domain, paths|
           domain_cookies = []
 
           paths.each { |path, hash|
-            hash.delete_if { |name, cookie|
+            hash.each { |name, cookie|
               if cookie.expired?(now) || (session && cookie.session?)
-                true
+                delete(cookie)
               else
                 domain_cookies << cookie
                 false
@@ -140,23 +144,25 @@ class HTTP::CookieJar
 
           all_cookies.concat(domain_cookies)
         }
+      }
 
-        if (debt = all_cookies.size - HTTP::Cookie::MAX_COOKIES_TOTAL) > 0
-          all_cookies.sort_by!(&:created_at)
-          all_cookies.slice!(0, debt).each { |cookie|
-            delete(cookie)
-          }
-        end
+      if (debt = all_cookies.size - HTTP::Cookie::MAX_COOKIES_TOTAL) > 0
+        all_cookies.sort_by!(&:created_at)
+        all_cookies.slice!(0, debt).each { |cookie|
+          delete(cookie)
+        }
+      end
 
+      synchronize {
         @jar.delete_if { |domain, paths|
           paths.delete_if { |path, hash|
             hash.empty?
           }
           paths.empty?
         }
-
-        @gc_index = 0
       }
+
+      @gc_index = 0
       self
     end
   end
